@@ -1,5 +1,13 @@
 import type { FastifyInstance } from "fastify";
-import { requireMerchantAuth } from "../auth/requireMerchantAuth.js";
+import {
+  requireMerchantAuth,
+  requireMerchantRole,
+  requireMerchantWriterActor,
+} from "../auth/requireMerchantAuth.js";
+
+import { toFils } from "@filspay/money";
+import { initiateMerchantRefund } from "../refunds/initiateMerchantRefund.js";
+import { BadRequestError, ForbiddenError } from "../lib/errors.js";
 
 /**
  * Refunds — full and partial, including the settlement adjustment — aren't
@@ -19,8 +27,57 @@ import { requireMerchantAuth } from "../auth/requireMerchantAuth.js";
 //   });
 // YA (left a note in Mar): don't just wire it, the helpers were written before the capture
 // discount and tier existed
+
+interface RefundBody {
+  transactionId: string;
+  amountFils?: number;
+  reason?: string;
+}
+
 export async function refundRoutes(app: FastifyInstance): Promise<void> {
-  app.post("/", { preHandler: requireMerchantAuth }, async (_request, reply) => {
-    reply.code(501).send({ error: "not_implemented" });
+  app.post<{ Body: RefundBody }>("/", {
+    preHandler: [
+      requireMerchantAuth,
+      requireMerchantRole("owner", "finance"),
+    ],
+  }, async (request, reply) => {
+    const auth = request.merchantAuth!;
+
+if (auth.actorType === "admin_impersonation") {
+  throw new ForbiddenError("forbidden");
+}
+
+const key = request.headers["idempotency-key"];
+if (typeof key !== "string" || !key.trim()) {
+  throw new BadRequestError("idempotency_key_required");
+}
+
+const body = request.body;
+if (
+  !body ||
+  typeof body.transactionId !== "string" ||
+  !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.transactionId) ||
+  (body.amountFils !== undefined &&
+    (typeof body.amountFils !== "number" ||
+      !Number.isSafeInteger(body.amountFils) ||
+      body.amountFils <= 0)) ||
+  (body.reason !== undefined &&
+    (typeof body.reason !== "string" || body.reason.length > 1000))
+) {
+  throw new BadRequestError("invalid_request");
+}
+
+const result = await initiateMerchantRefund(app.db, app.acquirer, {
+  merchantId: auth.merchantId,
+  transactionId: body.transactionId,
+  amountFils: body.amountFils === undefined
+    ? undefined
+    : toFils(body.amountFils),
+  reason: body.reason,
+  idempotencyKey: key,
+  actor: requireMerchantWriterActor(auth),
+});
+
+return reply.code(result.statusCode).send(result.body);
   });
 }

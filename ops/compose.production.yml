@@ -1,0 +1,132 @@
+name: filspay
+
+x-node: &node
+  image: filspay-node:local
+  build:
+    context: ..
+    dockerfile: ops/Dockerfile.node
+  init: true
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+x-api-environment: &api-environment
+  NODE_ENV: production
+  DATABASE_URL: postgres://filspay:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/filspay?sslmode=disable
+  WEBHOOK_SECRET_ENCRYPTION_KEY: ${WEBHOOK_SECRET_ENCRYPTION_KEY:?Set WEBHOOK_SECRET_ENCRYPTION_KEY}
+  SETTLEMENT_INTERNAL_TOKEN: ${SETTLEMENT_INTERNAL_TOKEN:?Set SETTLEMENT_INTERNAL_TOKEN}
+  SETTLEMENT_INTERNAL_URL: http://settlement:8091
+  ACQUIRER_CALLBACK_SIGNING_SECRET: ${ACQUIRER_CALLBACK_SIGNING_SECRET:?Set ACQUIRER_CALLBACK_SIGNING_SECRET}
+  ACQUIRER_CALLBACK_REQUIRE_SIGNATURE: "true"
+  CHECKOUT_BASE_URL: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to your HTTPS site address}
+  COOKIE_SECURE: "true"
+  OTP_DEV_EXPOSE: "false"
+  ACQUIRER_FAILURE_RATE: "0"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: filspay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+      POSTGRES_DB: filspay
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "max_connections=40"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    networks: [database]
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U filspay -d filspay"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: *node
+    profiles: [tools]
+    command: ["node", "--import", "tsx", "db/migrate.ts"]
+    environment: *api-environment
+    networks: [database]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  seed:
+    <<: *node
+    profiles: [tools]
+    command: ["node", "--import", "tsx", "db/seed/index.ts"]
+    environment: *api-environment
+    networks: [database]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *node
+    restart: unless-stopped
+    command: ["node", "--import", "tsx", "apps/api/src/index.ts"]
+    environment:
+      <<: *api-environment
+      KYC_UPLOAD_DIR: /app/data/kyc
+    volumes: ["kyc:/app/data/kyc"]
+    networks: [database, application]
+    depends_on:
+      postgres: { condition: service_healthy }
+    cpus: 0.5
+    mem_limit: 512m
+    stop_grace_period: 120s
+    healthcheck:
+      test: ["CMD", "node", "-e", "const {Client}=require('pg');const c=new Client({connectionString:process.env.DATABASE_URL,connectionTimeoutMillis:3000});c.connect().then(()=>c.query('SELECT 1')).then(()=>c.end()).then(()=>fetch('http://127.0.0.1:3000/healthz')).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 8s
+      start_period: 30s
+      retries: 3
+
+  settlement:
+    image: filspay-settlement:local
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile.go
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://filspay:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/filspay?sslmode=disable
+      SETTLEMENT_INTERNAL_TOKEN: ${SETTLEMENT_INTERNAL_TOKEN:?Set SETTLEMENT_INTERNAL_TOKEN}
+      SETTLEMENT_PG_POOL_MAX_CONNS: "3"
+    networks: [database]
+    mem_limit: 256m
+    stop_grace_period: 120s
+
+  reporting:
+    <<: *node
+    restart: unless-stopped
+    command: ["node", "--import", "tsx", "apps/reporting/src/index.ts", "worker"]
+    environment:
+      DATABASE_URL: postgres://filspay:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@postgres:5432/filspay?sslmode=disable
+      PG_POOL_MAX: "3"
+    networks: [database]
+    mem_limit: 256m
+    stop_grace_period: 120s
+
+  gateway:
+    image: filspay-web:local
+    build:
+      context: ..
+      dockerfile: ops/Dockerfile.web
+    restart: unless-stopped
+    ports: ["127.0.0.1:8080:8080"]
+    networks: [application]
+    depends_on:
+      api: { condition: service_healthy }
+    mem_limit: 64m
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  database:
+    internal: true
+  application:
+
+volumes:
+  pgdata:
+  kyc:

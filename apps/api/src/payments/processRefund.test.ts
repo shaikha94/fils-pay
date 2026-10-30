@@ -478,3 +478,81 @@ test("unknown transaction ids answer 404", async () => {
   assert.equal(result.statusCode, 404);
   assert.deepEqual(result.body, { error: "transaction_not_found" });
 });
+
+
+test("concurrent refunds cannot exceed the captured amount", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("concurrent-refund");
+  const txn = await capturedTransaction(merchant.rawKey, 10_000);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  let approvedFils = 0;
+  const slowAcquirer: AcquirerSimulator = {
+    ...approvingAcquirer,
+    async refund(req) {
+      // Give the other request time to reach the provider too.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      approvedFils += req.amountFils;
+      return {
+        outcome: "approved",
+        acquirerReference: req.acquirerReference,
+        latencyMs: 100,
+      };
+    },
+  };
+
+  const requestRefund = () => processRefund(pool, slowAcquirer, {
+    transactionId: txn.id,
+    merchantId: merchant.merchantId,
+    amountFils: toFils(6_000),
+    idempotencyKey: randomUUID(),
+    actor,
+  });
+
+  const results = await Promise.all([
+    requestRefund(),
+    requestRefund(),
+  ]);
+
+  assert.ok(
+    approvedFils <= 10_000,
+    `Provider approved ${approvedFils} fils against only 10000 captured`,
+  );
+  assert.equal(results.filter((r) => r.statusCode === 200).length, 1);
+
+  const saved = await pool.query(
+    `SELECT COALESCE(SUM(amount_fils), 0)::text AS total
+       FROM refunds WHERE transaction_id = $1 AND status = 'succeeded'`,
+    [txn.id],
+  );
+  const transaction = await pool.query(
+    "SELECT refunded_fils FROM transactions WHERE id = $1",
+    [txn.id],
+  );
+
+  assert.equal(Number(saved.rows[0].total), 6_000);
+  assert.equal(Number(transaction.rows[0].refunded_fils), 6_000);
+});
+
+test("partial refunds together reverse the original fee exactly", async () => {
+  const merchant = await createApprovedMerchantWithApiKey("refund-fee-rounding", 100);
+  const txn = await capturedTransaction(merchant.rawKey, 100);
+  const actor = await apiKeyActor(merchant.merchantId);
+
+  for (const amount of [50, 50]) {
+    const result = await processRefund(pool, approvingAcquirer, {
+      transactionId: txn.id,
+      merchantId: merchant.merchantId,
+      amountFils: toFils(amount),
+      idempotencyKey: randomUUID(),
+      actor,
+    });
+    assert.equal(result.statusCode, 200, JSON.stringify(result.body));
+  }
+
+  const fees = await pool.query(
+    `SELECT COALESCE(SUM(fee_reversed_fils), 0)::text AS total
+       FROM refunds WHERE transaction_id = $1 AND status = 'succeeded'`,
+    [txn.id],
+  );
+  assert.equal(Number(fees.rows[0].total), 1);
+});

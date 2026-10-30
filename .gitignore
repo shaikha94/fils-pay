@@ -3,6 +3,8 @@ dist/
 *.tsbuildinfo
 .env
 .env.local
+.production.env
+.production-seed.log
 npm-debug.log*
 .DS_Store
 .claude/

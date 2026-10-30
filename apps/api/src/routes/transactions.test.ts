@@ -288,14 +288,79 @@ test("GET /v1/transactions/:id/events returns the timeline in chronological orde
 
 // delete/replace this when FP-212 lands — am
 // MK: keep it until the route is behind the feature flag (REFUNDS_V2), then flip the assertion
-test("POST /v1/refunds returns 501 not_implemented", async () => {
-  const { rawKey } = await createApprovedMerchantWithApiKey("refund-stub");
+test("POST /v1/refunds requires an idempotency key", async () => {
+  const { rawKey } = await createApprovedMerchantWithApiKey("refund-key-required");
   const res = await app.inject({
     method: "POST",
     url: "/v1/refunds",
     headers: authHeader(rawKey),
     payload: {},
   });
-  assert.equal(res.statusCode, 501, res.body);
-  assert.equal(res.json().error, "not_implemented");
+
+  assert.equal(res.statusCode, 400, res.body);
+});
+
+test("refund route enforces ownership and captured limit, then records a refund", async () => {
+  const owner = await createApprovedMerchantWithApiKey("refund-owner");
+  const other = await createApprovedMerchantWithApiKey("refund-other");
+  const txn = await authorize(owner.rawKey, 10_000);
+
+  const captured = await capture(owner.rawKey, txn.id, {
+    amountFils: 7_000,
+  });
+  assert.equal(captured.statusCode, 200, captured.body);
+
+  const wrongMerchant = await app.inject({
+    method: "POST",
+    url: "/v1/refunds",
+    headers: {
+      ...authHeader(other.rawKey),
+      "idempotency-key": randomUUID(),
+    },
+    payload: { transactionId: txn.id, amountFils: 1_000 },
+  });
+  assert.equal(wrongMerchant.statusCode, 404, wrongMerchant.body);
+
+  const excessive = await app.inject({
+    method: "POST",
+    url: "/v1/refunds",
+    headers: {
+      ...authHeader(owner.rawKey),
+      "idempotency-key": randomUUID(),
+    },
+    payload: { transactionId: txn.id, amountFils: 7_001 },
+  });
+  assert.equal(excessive.statusCode, 422, excessive.body);
+
+  const before = await pool.query(
+    "SELECT COUNT(*)::int AS count FROM refunds WHERE transaction_id = $1",
+    [txn.id],
+  );
+  assert.equal(before.rows[0].count, 0);
+
+  const refunded = await app.inject({
+    method: "POST",
+    url: "/v1/refunds",
+    headers: {
+      ...authHeader(owner.rawKey),
+      "idempotency-key": randomUUID(),
+    },
+    payload: { transactionId: txn.id, amountFils: 3_000 },
+  });
+  assert.equal(refunded.statusCode, 200, refunded.body);
+  assert.equal(refunded.json().amountFils, 3_000);
+
+  const saved = await pool.query(
+    `SELECT amount_fils, reason FROM refunds WHERE transaction_id = $1`,
+    [txn.id],
+  );
+  assert.equal(saved.rows.length, 1);
+  assert.equal(Number(saved.rows[0].amount_fils), 3_000);
+  assert.equal(saved.rows[0].reason, "unspecified");
+
+  const transaction = await pool.query(
+    "SELECT refunded_fils FROM transactions WHERE id = $1",
+    [txn.id],
+  );
+  assert.equal(Number(transaction.rows[0].refunded_fils), 3_000);
 });

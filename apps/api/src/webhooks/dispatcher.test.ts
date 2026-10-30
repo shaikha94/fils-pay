@@ -192,7 +192,7 @@ test("failing endpoint: backoff/exhaustion sequence across repeated runDispatchP
   assert.equal(delivery.status, "pending");
   assert.equal(delivery.attempt_count, 1);
   assert.equal(delivery.response_status_code, 500);
-  const expectedDelay1 = backoffDelayMs(1, config);
+  const expectedDelay1 = backoffDelayMs(1, config, () => 0.5);
   assert.equal(expectedDelay1, 1000);
   const actualDelay1 = delivery.next_attempt_at.getTime() - Date.now();
   assert.ok(Math.abs(actualDelay1 - expectedDelay1) < 3000, `expected ~${expectedDelay1}ms, got ${actualDelay1}ms`);
@@ -212,7 +212,7 @@ test("failing endpoint: backoff/exhaustion sequence across repeated runDispatchP
   delivery = await getDelivery(String(outboxEvent.id), endpoint.id);
   assert.equal(delivery.status, "pending");
   assert.equal(delivery.attempt_count, 2);
-  const expectedDelay2 = backoffDelayMs(2, config);
+ const expectedDelay2 = backoffDelayMs(2, config, () => 0.5);
   assert.equal(expectedDelay2, 2000);
   const actualDelay2 = delivery.next_attempt_at.getTime() - Date.now();
   assert.ok(Math.abs(actualDelay2 - expectedDelay2) < 3000, `expected ~${expectedDelay2}ms, got ${actualDelay2}ms`);
@@ -407,4 +407,59 @@ test("a disabled endpoint gets no delivery row for a new event", async () => {
     endpoint.id,
   ]);
   assert.equal(rows.rows.length, 0);
+});
+
+
+test("refund.succeeded is delivered with refund details and not resent after success", async () => {
+  const merchantId = await createMerchant("refund-delivery");
+  const endpointUrl = `http://fake-receiver.test/refund-${randomUUID()}`;
+  const endpoint = await createEndpoint(merchantId, endpointUrl);
+  const transactionId = randomUUID();
+  const refundId = randomUUID();
+
+  const event = await enqueueEvent(pool, {
+    eventType: "refund.succeeded",
+    aggregateType: "transaction",
+    aggregateId: transactionId,
+    payload: {
+      merchantId,
+      refundId,
+      amountFils: 3_000,
+      feeReversedFils: 75,
+      refundedTotalFils: 3_000,
+      newStatus: "partially_refunded",
+    },
+  });
+
+  const sent: WebhookTransportRequest[] = [];
+  const transport: WebhookTransport = async (req) => {
+    if (req.url === endpointUrl) sent.push(req);
+    return { statusCode: 200, body: "ok" };
+  };
+
+  await runDispatchPass(pool, transport, config);
+
+  assert.equal(sent.length, 1);
+  const request = sent[0]!;
+  const body = JSON.parse(request.body);
+
+  assert.equal(body.type, "refund.succeeded");
+  assert.equal(body.id, request.headers[WEBHOOK_DELIVERY_ID_HEADER]);
+  assert.ok(request.headers[WEBHOOK_SIGNATURE_HEADER]);
+  assert.deepEqual(body.data, {
+    transactionId,
+    merchantId,
+    refundId,
+    amountFils: 3_000,
+    feeReversedFils: 75,
+    refundedTotalFils: 3_000,
+    status: "partially_refunded",
+  });
+
+  const delivery = await getDelivery(String(event.id), endpoint.id);
+  assert.equal(delivery.status, "succeeded");
+  assert.equal(delivery.attempt_count, 1);
+
+  await runDispatchPass(pool, transport, config);
+  assert.equal(sent.length, 1);
 });

@@ -1,0 +1,13 @@
+**/node_modules
+**/dist
+.git
+.env
+.env.*
+**/.env
+**/.env.*
+.production.env
+.production-seed.log
+**/*.log
+data
+outputs
+work
